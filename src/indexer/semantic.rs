@@ -1224,6 +1224,18 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
 
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    // The message watermark must mirror the SQL predicate above: it only
+    // applies on the append-rescan pass (`after_conversation_id <= 0`), where
+    // already-embedded conversations are re-visited for messages newer than
+    // the checkpoint. On the conversation-cursor pass the selected
+    // conversations have never been staged, so filtering their (older)
+    // message PKs against a global watermark empties them and the cursor
+    // livelocks at the same offset forever.
+    let retention_message_cursor = if sql_message_cursor {
+        after_message_id
+    } else {
+        None
+    };
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
@@ -1231,7 +1243,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     } = select_checkpoint_capped_conversations(
         conversations,
         &mut grouped_messages,
-        after_message_id,
+        retention_message_cursor,
         caps,
     );
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
