@@ -10,6 +10,7 @@
 //!
 //! | Name | ID | Type | Notes |
 //! |------|-----|------|-------|
+//! | qwen3-rerank | dashscope-qwen3-rerank | DashScope API | Default Chinese/multilingual reranker |
 //! | ms-marco | ms-marco-minilm-l6-v2 | Cross-encoder | Baseline for bake-off |
 //! | bge-reranker-v2 | bge-reranker-v2-m3 | Cross-encoder | BGE v2 (eligible) |
 //! | jina-reranker-turbo | jina-reranker-v1-turbo-en | Cross-encoder | Fast (eligible) |
@@ -18,11 +19,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::dashscope_reranker::{DashScopeReranker, QWEN3_RERANKER_ID, QWEN3_RERANKER_NAME};
 use super::fastembed_reranker::FastEmbedReranker;
 use super::reranker::{Reranker, RerankerError, RerankerResult};
 
 /// Default reranker name when none specified.
-pub const DEFAULT_RERANKER: &str = "ms-marco";
+pub const DEFAULT_RERANKER: &str = QWEN3_RERANKER_NAME;
 
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
@@ -143,6 +145,17 @@ impl RegisteredReranker {
 /// candidates for the reranker bake-off. The baseline (ms-marco) is not eligible
 /// but used for comparison.
 pub static RERANKERS: &[RegisteredReranker] = &[
+    // === Default remote reranker ===
+    RegisteredReranker {
+        name: QWEN3_RERANKER_NAME,
+        id: QWEN3_RERANKER_ID,
+        description: "Qwen3 Rerank via Alibaba Cloud DashScope - Chinese/multilingual default",
+        requires_model_files: false,
+        release_date: "2025-06-05",
+        huggingface_id: "DashScope/qwen3-rerank",
+        size_bytes: 0,
+        is_baseline: false,
+    },
     // === Baseline (not eligible for bake-off) ===
     RegisteredReranker {
         name: "ms-marco",
@@ -219,6 +232,7 @@ impl RerankerRegistry {
         RERANKERS.iter().find(|r| {
             r.name == name_lower
                 || r.id == name_lower
+                || reranker_alias_matches(&name_lower, r.name)
                 || r.id.starts_with(&format!("{}-", name_lower))
         })
     }
@@ -325,6 +339,7 @@ pub fn get_reranker(data_dir: &Path, name: Option<&str>) -> RerankerResult<Arc<d
     };
 
     match reranker_info.name {
+        "qwen3-rerank" => Ok(Arc::new(DashScopeReranker::from_env()?)),
         // All ONNX-based rerankers (baseline and bake-off candidates)
         "ms-marco" | "bge-reranker-v2" | "jina-reranker-turbo" | "jina-reranker-v2" => {
             let model_dir = RERANKERS
@@ -345,6 +360,20 @@ pub fn get_reranker(data_dir: &Path, name: Option<&str>) -> RerankerResult<Arc<d
             format!("reranker '{}' not implemented", reranker_info.name),
         )),
     }
+}
+
+/// True when a user-supplied CLI alias points at a registered reranker.
+pub fn reranker_alias_matches(alias: &str, canonical: &str) -> bool {
+    matches!(
+        (alias, canonical),
+        ("qwen-rerank", "qwen3-rerank")
+            | ("qwen3", "qwen3-rerank")
+            | ("qwen", "qwen3-rerank")
+            | ("dashscope", "qwen3-rerank")
+            | ("dashscope-qwen3-rerank", "qwen3-rerank")
+            | ("aliyun-qwen3-rerank", "qwen3-rerank")
+            | ("alibaba-qwen3-rerank", "qwen3-rerank")
+    )
 }
 
 fn rerank_failed(model: &str, source: impl Into<String>) -> RerankerError {
@@ -368,7 +397,7 @@ mod tests {
     #[test]
     fn test_registry_all() {
         let (_tmp, registry) = registry_fixture();
-        assert!(registry.all().len() >= 4);
+        assert!(registry.all().len() >= 5);
     }
 
     #[test]
@@ -376,6 +405,8 @@ mod tests {
         let (_tmp, registry) = registry_fixture();
 
         let cases = [
+            ("qwen3-rerank", "dashscope-qwen3-rerank"),
+            ("qwen", "dashscope-qwen3-rerank"),
             ("ms-marco", "ms-marco-minilm-l6-v2"),
             ("bge-reranker-v2", "bge-reranker-v2-m3"),
         ];
@@ -405,8 +436,11 @@ mod tests {
     fn test_rerankers_unavailable_without_files() {
         let (_tmp, registry) = registry_fixture();
 
-        // All rerankers should be unavailable without model files
+        // File-backed rerankers should be unavailable without model files.
         for r in registry.all() {
+            if !r.requires_model_files {
+                continue;
+            }
             assert!(
                 !registry.is_available(r.name),
                 "{} should be unavailable without files",
@@ -419,9 +453,11 @@ mod tests {
     fn test_best_available_none() {
         let (_tmp, registry) = registry_fixture();
 
-        // Without model files, best_available should return None
+        // The DashScope Qwen reranker is the configured default and needs no
+        // local model files; API-key validation happens when it is loaded.
         let best = registry.best_available();
-        assert!(best.is_none());
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().name, "qwen3-rerank");
     }
 
     #[test]

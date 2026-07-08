@@ -296,6 +296,18 @@ cass search "how to handle user login" --mode semantic --robot
 cass search "auth error handling" --mode hybrid --robot
 ```
 
+#### Optional Qwen Reranking
+
+`cass search --rerank` reranks the candidate hits returned by lexical/semantic/hybrid search. To use cass's built-in multi-route retrieval fusion, keep the default hybrid mode or pass `--mode hybrid`; cass fuses lexical and semantic candidates with RRF before the Qwen reranker sorts that candidate set. The default reranker is Alibaba Cloud DashScope `qwen3-rerank`, selected for Chinese and multilingual agent-history search. It is an online API call, not a local model download.
+
+```bash
+export DASHSCOPE_API_KEY=...
+cass search "中国社会科学报" --mode hybrid --limit 20 --rerank --robot
+cass search "阿里云 qwen" --mode hybrid --limit 20 --rerank --reranker qwen3-rerank --robot
+```
+
+The Qwen endpoint defaults to `https://dashscope.aliyuncs.com/compatible-api/v1/reranks`. Override it with `CASS_DASHSCOPE_RERANK_URL` or set `DASHSCOPE_WORKSPACE_ID` for a workspace-scoped Model Studio endpoint.
+
 ### 🎯 Advanced Search Features
 - **Wildcard Patterns**: Full glob-style pattern support:
   - `foo*` - Prefix match (finds "foobar", "foo123")

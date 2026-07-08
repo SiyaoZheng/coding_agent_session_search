@@ -11,6 +11,7 @@
 //! - **[`reranker`]**: Reranker trait for cross-encoder reranking of search results.
 //! - **[`reranker_registry`]**: Reranker registry for model selection with bake-off support.
 //! - **[`fastembed_reranker`]**: FastEmbed-backed cross-encoder reranker (ms-marco-MiniLM-L-6-v2).
+//! - **[`dashscope_reranker`]**: DashScope-backed Qwen3 reranker for Chinese/multilingual search.
 //! - **[`daemon_client`]**: Daemon client wrappers for warm embedder/reranker (bd-1lps).
 //! - **[`model_manager`]**: Semantic model detection + context wiring (no downloads).
 //! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
@@ -28,6 +29,7 @@ pub mod canonicalize;
 pub(crate) mod command_envelope;
 pub(crate) mod contention_diagnostics;
 pub mod daemon_client;
+pub mod dashscope_reranker;
 pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;
 pub mod embedder;

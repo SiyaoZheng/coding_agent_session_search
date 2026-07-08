@@ -503,7 +503,7 @@ pub enum Commands {
         // ==========================================================================
         /// Embedding model to use for semantic search.
         /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// Use `cass models status --json` to see available local embedding models.
         #[arg(long)]
         model: Option<String>,
 
@@ -513,7 +513,7 @@ pub enum Commands {
         rerank: bool,
 
         /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Defaults to qwen3-rerank via DashScope. Set DASHSCOPE_API_KEY first.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -22977,13 +22977,13 @@ fn run_cli_search(
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::fastembed_reranker::FastEmbedReranker;
+        use crate::search::dashscope_reranker::QWEN3_RERANKER_ID;
         use crate::search::reranker::{Reranker, rerank_texts};
+        use crate::search::reranker_registry::get_reranker;
 
-        let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
-        let local_reranker: Option<Arc<dyn Reranker>> =
-            match FastEmbedReranker::load_from_dir(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
+        let base_reranker: Option<Arc<dyn Reranker>> =
+            match get_reranker(&data_dir, semantic_opts.reranker.as_deref()) {
+                Ok(reranker) => Some(reranker),
                 Err(e) => {
                     if !semantic_opts.use_daemon {
                         tracing::debug!(error = %e, "Reranker not available, skipping rerank");
@@ -22991,52 +22991,65 @@ fn run_cli_search(
                     None
                 }
             };
+        let base_is_dashscope_qwen = base_reranker
+            .as_ref()
+            .is_some_and(|reranker| reranker.id() == QWEN3_RERANKER_ID);
 
-        let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
+        let reranker: Option<Arc<dyn Reranker>> =
+            if semantic_opts.use_daemon && !base_is_dashscope_qwen {
+                use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
 
-            #[cfg(unix)]
-            {
-                let daemon = crate::daemon::client::try_connect()
-                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                    .unwrap_or_else(|| {
-                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ))
-                    });
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-            #[cfg(not(unix))]
-            {
-                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                    "daemon-unconfigured",
-                ));
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-        } else {
-            local_reranker
-        };
+                #[cfg(unix)]
+                {
+                    let daemon = crate::daemon::client::try_connect()
+                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                        .unwrap_or_else(|| {
+                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                "daemon-unconfigured",
+                            ))
+                        });
+                    let config = DaemonRetryConfig::from_env();
+                    Some(Arc::new(DaemonFallbackReranker::new(
+                        daemon,
+                        base_reranker,
+                        config,
+                    )))
+                }
+                #[cfg(not(unix))]
+                {
+                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                        "daemon-unconfigured",
+                    ));
+                    let config = DaemonRetryConfig::from_env();
+                    Some(Arc::new(DaemonFallbackReranker::new(
+                        daemon,
+                        base_reranker,
+                        config,
+                    )))
+                }
+            } else {
+                base_reranker
+            };
 
         if let Some(reranker) = reranker {
-            // Extract content from hits for reranking (use snippet if content is empty)
+            // Extract title + content for reranking. Agent-history searches are
+            // often title/task/file-path heavy, so feeding only the message body
+            // makes exact title hits look artificially weak to cross-encoders.
             let docs: Vec<String> = result
                 .hits
                 .iter()
                 .map(|hit| {
-                    if hit.content.is_empty() {
+                    let body = if hit.content.is_empty() {
                         hit.snippet.clone()
                     } else {
                         hit.content.clone()
+                    };
+                    if hit.title.trim().is_empty() {
+                        body
+                    } else if body.trim().is_empty() {
+                        format!("Title: {}", hit.title.trim())
+                    } else {
+                        format!("Title: {}\nContent: {}", hit.title.trim(), body.trim())
                     }
                 })
                 .collect();
@@ -96617,6 +96630,10 @@ fn native_backend_supports_model(registry_name: &str) -> bool {
     matches!(registry_name, "minilm" | "ms-marco")
 }
 
+fn model_is_remote_service(registry_name: &str) -> bool {
+    registry_name == "qwen3-rerank"
+}
+
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
     match model_name.to_ascii_lowercase().as_str() {
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
@@ -96630,15 +96647,20 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
         "jina-reranker-turbo" | "jina-reranker-v1-turbo" | "jina-reranker-v1-turbo-en" => {
             Ok("jina-reranker-turbo")
         }
+        "qwen3-rerank" | "qwen-rerank" | "qwen3" | "qwen" | "dashscope"
+        | "dashscope-qwen3-rerank" | "aliyun-qwen3-rerank" | "alibaba-qwen3-rerank" => {
+            Ok("qwen3-rerank")
+        }
         _ => Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
+                 snowflake-arctic-s, nomic-embed. Rerankers: qwen3-rerank, ms-marco, \
+                 jina-reranker-turbo.",
                 model_name
             ),
-            hint: Some("Use 'cass models status' to see available models".into()),
+            hint: Some("Use 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking".into()),
             retryable: false,
         }),
     }
@@ -96704,6 +96726,20 @@ fn run_models_install(
     use indicatif::{ProgressBar, ProgressStyle};
 
     let registry_name = resolve_cli_model_name(model_name)?;
+    if model_is_remote_service(registry_name) {
+        return Err(CliError {
+            code: 20,
+            kind: CliErrorKind::Model.kind_str(),
+            message: format!(
+                "Model '{registry_name}' is a remote DashScope reranker and does not need local installation."
+            ),
+            hint: Some(
+                "Set DASHSCOPE_API_KEY, then run: cass search '<query>' --rerank --reranker qwen3-rerank"
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
     if !native_backend_supports_model(registry_name) {
         return Err(CliError {
             code: 20,
@@ -98865,14 +98901,17 @@ mod cli_models_resolution_tests {
         assert!(
             err.message.contains("snowflake-arctic-s")
                 && err.message.contains("nomic-embed")
-                && err.message.contains("all-minilm-l6-v2"),
-            "error must list all 3 supported models so operators discover non-default options; \
+                && err.message.contains("all-minilm-l6-v2")
+                && err.message.contains("qwen3-rerank"),
+            "error must list supported models so operators discover non-default options; \
              got {message:?}",
             message = err.message
         );
         assert_eq!(
             err.hint.as_deref(),
-            Some("Use 'cass models status' to see available models")
+            Some(
+                "Use 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking"
+            )
         );
         assert!(!err.retryable);
     }
@@ -98917,6 +98956,11 @@ mod cli_models_resolution_tests {
         use crate::search::reranker_registry::RERANKERS;
 
         for (alias, canonical) in [
+            ("qwen3-rerank", "qwen3-rerank"),
+            ("qwen-rerank", "qwen3-rerank"),
+            ("qwen", "qwen3-rerank"),
+            ("dashscope", "qwen3-rerank"),
+            ("dashscope-qwen3-rerank", "qwen3-rerank"),
             ("ms-marco", "ms-marco"),
             ("ms-marco-minilm", "ms-marco"),
             ("ms-marco-minilm-l-6-v2", "ms-marco"),
@@ -98930,6 +98974,9 @@ mod cli_models_resolution_tests {
                 canonical,
                 "reranker alias {alias:?} must resolve to {canonical:?}"
             );
+            if model_is_remote_service(canonical) {
+                continue;
+            }
             assert!(
                 ModelManifest::for_reranker(canonical).is_some(),
                 "canonical reranker {canonical:?} must have a ModelManifest registered"
@@ -98963,5 +99010,20 @@ mod cli_models_resolution_tests {
                  loader agree on the on-disk directory"
             );
         }
+    }
+
+    #[test]
+    fn remote_reranker_install_reports_no_local_install_needed() {
+        let err = run_models_install("qwen3-rerank", None, None, true, None)
+            .expect_err("remote reranker install must be rejected clearly");
+        assert_eq!(err.code, 20);
+        assert_eq!(err.kind, "model");
+        assert!(err.message.contains("remote DashScope reranker"));
+        assert!(
+            err.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cass search '<query>' --rerank --reranker qwen3-rerank")
+        );
     }
 }
