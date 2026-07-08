@@ -1028,12 +1028,21 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         ParamValue::from(after_conversation_id),
         ParamValue::from(query_limit_i64),
     ];
-    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
-        params.push(ParamValue::from(after_message_id));
-        " AND id > ?3"
-    } else {
-        ""
-    };
+    // Checkpoint-capped backfill keeps selected conversations whole and
+    // advances `last_offset` to the last fully staged conversation. Once that
+    // conversation cursor is present, `c.id > ?1` is already sufficient for
+    // the ID selection query; the message cursor is still applied later when
+    // materialized messages are retained. Keeping `id > ?3` inside this
+    // correlated EXISTS subquery makes fsqlite walk a very slow fallback path
+    // on large archives.
+    let sql_message_cursor = after_conversation_id <= 0;
+    let message_cursor_predicate =
+        if sql_message_cursor && let Some(after_message_id) = after_message_id {
+            params.push(ParamValue::from(after_message_id));
+            " AND id > ?3"
+        } else {
+            ""
+        };
     let hinted_sql = format!(
         "SELECT c.id
          FROM conversations c
