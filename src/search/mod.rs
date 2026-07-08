@@ -8,6 +8,7 @@
 //! - **[`embedder_registry`]**: Embedder registry for model selection (bd-2mbe).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
 //! - **[`fastembed_embedder`]**: FastEmbed-backed ML embedder (MiniLM).
+//! - **[`dashscope_embedder`]**: DashScope-backed Qwen v4 embedder for Chinese/multilingual search.
 //! - **[`reranker`]**: Reranker trait for cross-encoder reranking of search results.
 //! - **[`reranker_registry`]**: Reranker registry for model selection with bake-off support.
 //! - **[`fastembed_reranker`]**: FastEmbed-backed cross-encoder reranker (ms-marco-MiniLM-L-6-v2).
@@ -29,6 +30,7 @@ pub mod canonicalize;
 pub(crate) mod command_envelope;
 pub(crate) mod contention_diagnostics;
 pub mod daemon_client;
+pub mod dashscope_embedder;
 pub mod dashscope_reranker;
 pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;

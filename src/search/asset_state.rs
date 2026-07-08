@@ -23,7 +23,9 @@ use crate::indexer::{
     load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
+use crate::search::dashscope_embedder::QWEN_V4_EMBEDDER_NAME;
 use crate::search::embedder::Embedder;
+use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER, canonical_embedder_name};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
@@ -849,6 +851,14 @@ fn semantic_preference_surface(
     preference: SemanticPreference,
 ) -> SemanticPreferenceSurface {
     match preference {
+        SemanticPreference::DefaultModel
+            if active_policy_embedder_name() == Some(QWEN_V4_EMBEDDER_NAME) =>
+        {
+            SemanticPreferenceSurface {
+                preferred_backend: "dashscope",
+                model_dir: None,
+            }
+        }
         SemanticPreference::DefaultModel => SemanticPreferenceSurface {
             preferred_backend: "fastembed",
             model_dir: active_policy_model_dir(data_dir),
@@ -1025,13 +1035,15 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 }
 
 fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
-    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
+    let embedder_name = active_policy_embedder_name()?;
     FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
-    let embedder_name = FastEmbedder::canonical_name(embedder_id)?;
+    let embedder_name = canonical_embedder_name(embedder_id)?;
+    if embedder_name == QWEN_V4_EMBEDDER_NAME || embedder_name == HASH_EMBEDDER {
+        return None;
+    }
     FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
 }
 
@@ -1513,14 +1525,35 @@ fn semantic_embedder_id(
         SemanticAvailability::Ready { embedder_id }
         | SemanticAvailability::UpdateAvailable { embedder_id, .. }
         | SemanticAvailability::IndexBuilding { embedder_id, .. } => Some(embedder_id.clone()),
+        SemanticAvailability::IndexMissing { index_path } => {
+            embedder_id_from_vector_index_path(index_path).or_else(|| active_policy_embedder_id())
+        }
         SemanticAvailability::HashFallback => Some(HashEmbedder::default().id().to_string()),
         _ => match preference {
-            SemanticPreference::DefaultModel => {
-                Some(FastEmbedder::embedder_id_static().to_string())
-            }
+            SemanticPreference::DefaultModel => active_policy_embedder_id(),
             SemanticPreference::HashFallback => Some(HashEmbedder::default().id().to_string()),
         },
     }
+}
+
+fn active_policy_embedder_name() -> Option<&'static str> {
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    canonical_embedder_name(&policy.quality_tier_embedder)
+}
+
+fn active_policy_embedder_id() -> Option<String> {
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let name = canonical_embedder_name(&policy.quality_tier_embedder)?;
+    let registry = EmbedderRegistry::new(Path::new(""));
+    registry.get(name).map(|embedder| embedder.id.to_string())
+}
+
+fn embedder_id_from_vector_index_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("index-"))
+        .and_then(|name| name.strip_suffix(".fsvi"))
+        .map(ToOwned::to_owned)
 }
 
 fn semantic_vector_index_path(
@@ -3083,11 +3116,7 @@ mod tests {
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
         let cases = [
-            (
-                SemanticPreference::DefaultModel,
-                "fastembed",
-                Some(FastEmbedder::default_model_dir(data_dir)),
-            ),
+            (SemanticPreference::DefaultModel, "dashscope", None),
             (SemanticPreference::HashFallback, "hash", None),
         ];
 

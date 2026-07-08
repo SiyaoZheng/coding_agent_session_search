@@ -25,7 +25,9 @@ use crate::indexer::semantic_progress::{
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::dashscope_embedder::{DashScopeEmbedder, QWEN_V4_EMBEDDER_NAME};
 use crate::search::embedder::Embedder;
+use crate::search::embedder_registry::{HASH_EMBEDDER, canonical_embedder_name};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
@@ -1570,21 +1572,22 @@ pub struct SemanticIndexer {
 
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
-        let embedder: Box<dyn Embedder> = match embedder_type {
-            "fastembed" | "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
+        let canonical_name = canonical_embedder_name(embedder_type)
+            .ok_or_else(|| anyhow::anyhow!("unknown embedder: {embedder_type}"))?;
+        let embedder: Box<dyn Embedder> = match canonical_name {
+            QWEN_V4_EMBEDDER_NAME => Box::new(
+                DashScopeEmbedder::from_env()
+                    .map_err(|e| anyhow::anyhow!("qwen-v4 unavailable: {e}"))?,
+            ),
+            "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
                 let dir = data_dir
                     .ok_or_else(|| anyhow::anyhow!("data_dir required for fastembed embedder"))?;
-                let embedder_name = if embedder_type == "fastembed" {
-                    "minilm"
-                } else {
-                    embedder_type
-                };
                 Box::new(
-                    FastEmbedder::load_by_name(dir, embedder_name)
+                    FastEmbedder::load_by_name(dir, canonical_name)
                         .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
                 )
             }
-            "hash" => Box::new(HashEmbedder::default()),
+            HASH_EMBEDDER => Box::new(HashEmbedder::default()),
             other => bail!("unknown embedder: {other}"),
         };
 

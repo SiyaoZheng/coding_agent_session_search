@@ -13,7 +13,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::search::dashscope_embedder::{DashScopeEmbedder, QWEN_V4_EMBEDDER_NAME};
 use crate::search::embedder::Embedder;
+use crate::search::embedder_registry::canonical_embedder_name;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_download::{
@@ -469,7 +471,10 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     data_dir: &Path,
     embedder_name: &str,
 ) -> SemanticAvailability {
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    let canonical_name = canonical_embedder_name(embedder_name).unwrap_or(QWEN_V4_EMBEDDER_NAME);
+    if canonical_name == QWEN_V4_EMBEDDER_NAME {
+        return probe_dashscope_semantic_availability(data_dir);
+    }
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
         return SemanticAvailability::LoadFailed {
             context: format!("unknown semantic embedder: {embedder_name}"),
@@ -510,6 +515,26 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
         SemanticAvailability::IndexMissing { index_path }
     } else {
         SemanticAvailability::HashFallback
+    }
+}
+
+/// Probe DashScope semantic availability without opening the DB or vector index.
+pub(crate) fn probe_dashscope_semantic_availability(data_dir: &Path) -> SemanticAvailability {
+    let embedder = match DashScopeEmbedder::from_env() {
+        Ok(embedder) => embedder,
+        Err(err) => {
+            return SemanticAvailability::LoadFailed {
+                context: format!("qwen-v4 config: {err}"),
+            };
+        }
+    };
+    let index_path = vector_index_path(data_dir, embedder.id());
+    if !index_path.is_file() {
+        SemanticAvailability::IndexMissing { index_path }
+    } else {
+        SemanticAvailability::Ready {
+            embedder_id: embedder.id().to_string(),
+        }
     }
 }
 
@@ -594,6 +619,98 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
     }
 }
 
+/// Load DashScope-backed semantic context (no local model files required).
+pub fn load_dashscope_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    let embedder = match DashScopeEmbedder::from_env() {
+        Ok(embedder) => embedder,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("qwen-v4 config: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+    let embedder_id = embedder.id().to_string();
+    let index_path = vector_index_path(data_dir, &embedder_id);
+    let monolithic_present = index_path.is_file();
+    let shard_indexes = if monolithic_present
+        || complete_shard_generation_candidate_exists(data_dir, &embedder_id)
+    {
+        load_complete_shard_indexes_for_current_db(
+            data_dir,
+            db_path,
+            &embedder_id,
+            "qwen-v4 semantic",
+        )
+    } else {
+        None
+    };
+    if !monolithic_present && shard_indexes.is_none() {
+        return SemanticSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
+
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::DatabaseUnavailable {
+                    db_path: db_path.to_path_buf(),
+                    error: err.to_string(),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+        Ok(maps) => maps,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("filter maps: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
+        let index = indexes.remove(0);
+        (index, indexes)
+    } else {
+        match VectorIndex::open(&index_path) {
+            Ok(index) => (index, Vec::new()),
+            Err(err) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed {
+                        context: format!("vector index: {err}"),
+                    },
+                    context: None,
+                };
+            }
+        }
+    };
+
+    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+    let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
+
+    SemanticSetup {
+        availability: SemanticAvailability::Ready { embedder_id },
+        context: Some(SemanticContext {
+            embedder,
+            index,
+            additional_indexes,
+            filter_maps,
+            roles,
+        }),
+    }
+}
+
 /// Load semantic context without version checking.
 ///
 /// Use this when you've already acknowledged an update and want to load
@@ -608,7 +725,10 @@ fn load_semantic_context_inner(
     check_for_updates: bool,
     embedder_name: &str,
 ) -> SemanticSetup {
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    let canonical_name = canonical_embedder_name(embedder_name).unwrap_or(QWEN_V4_EMBEDDER_NAME);
+    if canonical_name == QWEN_V4_EMBEDDER_NAME {
+        return load_dashscope_semantic_context(data_dir, db_path);
+    }
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
         return SemanticSetup {
             availability: SemanticAvailability::LoadFailed {
@@ -735,7 +855,7 @@ fn load_semantic_context_inner(
 
 fn active_policy_embedder_name() -> &'static str {
     let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("minilm")
+    canonical_embedder_name(&semantic_policy.quality_tier_embedder).unwrap_or(QWEN_V4_EMBEDDER_NAME)
 }
 
 fn semantic_availability_from_cache_state(

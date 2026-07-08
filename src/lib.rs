@@ -22617,19 +22617,15 @@ fn run_cli_search(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
     ) {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+        use crate::search::embedder_registry::{
+            EmbedderRegistry, HASH_EMBEDDER, canonical_embedder_name,
+        };
 
         // Use embedder registry for model selection (bd-2mbe)
         let registry = EmbedderRegistry::new(&data_dir);
         let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
             .ok()
-            .and_then(|value| {
-                if value.trim().eq_ignore_ascii_case("hash") {
-                    Some("hash")
-                } else {
-                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
-                }
-            });
+            .and_then(|value| canonical_embedder_name(&value));
         let requested_model = semantic_opts.model.as_deref().or(env_model);
 
         // Validate requested model if specified
@@ -22656,6 +22652,8 @@ fn run_cli_search(
             load_hash_semantic_context(&data_dir, &db_path)
         } else if let Some(model_name) = requested_model {
             load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
+        } else if let Some(model_info) = embedder_info {
+            load_semantic_context_for_embedder(&data_dir, &db_path, model_info.name)
         } else {
             load_semantic_context(&data_dir, &db_path)
         };
@@ -96349,18 +96347,9 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     // The policy stores short aliases (e.g. "snowflake", "minilm") while
     // ModelManifest::for_embedder expects registry names — match both.
     let policy_embedder = policy.quality_tier_embedder.as_str();
-    let active_registry_name = match policy_embedder {
-        "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
-        "snowflake"
-        | "snowflake-arctic-s"
-        | "snowflake-arctic-embed-s"
-        | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
-        "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
-            Some("nomic-embed")
-        }
-        "hash" => None, // hash fallback — no model files
-        _ => None,
-    };
+    let active_registry_name =
+        crate::search::embedder_registry::canonical_embedder_name(policy_embedder)
+            .filter(|name| *name != crate::search::embedder_registry::HASH_EMBEDDER);
 
     // Per-model status snapshot.
     struct ModelStatus {
@@ -96533,7 +96522,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             println!("  No ONNX model is in use; semantic search runs in hash-fallback mode.");
         }
         println!(
-            "Override with: CASS_SEMANTIC_EMBEDDER={{minilm|snowflake-arctic-s|nomic-embed|hash}}"
+            "Override with: CASS_SEMANTIC_EMBEDDER={{qwen-v4|text-embedding-v4|minilm|snowflake-arctic-s|nomic-embed|hash}}"
         );
         println!("Fail-open: lexical search remains available.");
         println!();
@@ -96601,7 +96590,11 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             println!();
         }
 
-        if active_status.is_none() && policy_embedder != "hash" {
+        if active_status.is_none()
+            && policy_embedder != "hash"
+            && active_registry_name
+                != Some(crate::search::dashscope_embedder::QWEN_V4_EMBEDDER_NAME)
+        {
             println!(
                 "{}: active embedder '{}' has no manifest registered. \
                  Use 'cass models install --model <name>' to install one of the supported embedders.",
@@ -96631,11 +96624,13 @@ fn native_backend_supports_model(registry_name: &str) -> bool {
 }
 
 fn model_is_remote_service(registry_name: &str) -> bool {
-    registry_name == "qwen3-rerank"
+    matches!(registry_name, "qwen-v4" | "qwen3-rerank")
 }
 
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
     match model_name.to_ascii_lowercase().as_str() {
+        "qwen-v4" | "qwen-embedding" | "qwen-embed" | "text-embedding-v4"
+        | "dashscope-text-embedding-v4" => Ok("qwen-v4"),
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
         "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
             Ok("snowflake-arctic-s")
@@ -96656,11 +96651,11 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed. Rerankers: qwen3-rerank, ms-marco, \
-                 jina-reranker-turbo.",
+                 snowflake-arctic-s, nomic-embed, qwen-v4 (remote text-embedding-v4). \
+                 Rerankers: qwen3-rerank, ms-marco, jina-reranker-turbo.",
                 model_name
             ),
-            hint: Some("Use 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking".into()),
+            hint: Some("Use 'cass index --semantic --embedder qwen-v4' after setting DASHSCOPE_API_KEY, or 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking".into()),
             retryable: false,
         }),
     }
@@ -96727,16 +96722,24 @@ fn run_models_install(
 
     let registry_name = resolve_cli_model_name(model_name)?;
     if model_is_remote_service(registry_name) {
+        let (kind, command) = if registry_name == "qwen-v4" {
+            (
+                "embedding service",
+                "Set DASHSCOPE_API_KEY, then run: cass index --semantic --embedder qwen-v4",
+            )
+        } else {
+            (
+                "reranker",
+                "Set DASHSCOPE_API_KEY, then run: cass search '<query>' --rerank --reranker qwen3-rerank",
+            )
+        };
         return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Model '{registry_name}' is a remote DashScope reranker and does not need local installation."
+                "Model '{registry_name}' is a remote DashScope {kind} and does not need local installation."
             ),
-            hint: Some(
-                "Set DASHSCOPE_API_KEY, then run: cass search '<query>' --rerank --reranker qwen3-rerank"
-                    .into(),
-            ),
+            hint: Some(command.into()),
             retryable: false,
         });
     }
@@ -97254,7 +97257,9 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
 fn resolve_semantic_index_embedder(raw: &str) -> String {
     let requested = raw.trim();
     if !matches!(requested, "fastembed" | "minilm") {
-        return requested.to_string();
+        return crate::search::embedder_registry::canonical_embedder_name(requested)
+            .map(str::to_string)
+            .unwrap_or_else(|| requested.to_string());
     }
 
     let policy = crate::search::policy::SemanticPolicy::resolve(
@@ -97267,9 +97272,9 @@ fn resolve_semantic_index_embedder(raw: &str) -> String {
     {
         return "hash".to_string();
     }
-    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
-        &policy.quality_tier_embedder,
-    ) else {
+    let Some(policy_embedder) =
+        crate::search::embedder_registry::canonical_embedder_name(&policy.quality_tier_embedder)
+    else {
         return requested.to_string();
     };
     if policy_embedder == "minilm" {
@@ -97330,16 +97335,15 @@ fn run_models_backfill(
             TierKind::Quality => "fastembed".to_string(),
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
-    let embedder_valid = embedder_type == "hash"
-        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .is_some();
+    let embedder_valid =
+        crate::search::embedder_registry::canonical_embedder_name(&embedder_type).is_some();
     if !embedder_valid {
         return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
             hint: Some(
-                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
+                "Use --embedder qwen-v4, --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
                     .into(),
             ),
             retryable: false,
@@ -97437,26 +97441,32 @@ fn run_models_backfill(
         hint: Some("Check permissions under the cass data directory".into()),
         retryable: true,
     })?;
-    let model_manifest =
-        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .and_then(ModelManifest::for_embedder)
-            .unwrap_or_else(ModelManifest::minilm_v2);
-    let model_revision = if embedder_type == "hash" {
-        "hash".to_string()
-    } else {
-        model_manifest.revision.clone()
-    };
     let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
         code: 20,
         kind: CliErrorKind::Model.kind_str(),
         message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
         hint: Some(if embedder_type == "fastembed" {
             "Run 'cass models install -y' or retry with --embedder hash".into()
+        } else if embedder_type == "qwen-v4" {
+            "Set DASHSCOPE_API_KEY or retry with --embedder hash".into()
         } else {
             "Use --embedder hash or install the selected embedder model".into()
         }),
         retryable: embedder_type != "hash",
     })?;
+    let canonical_embedder =
+        crate::search::embedder_registry::canonical_embedder_name(&embedder_type)
+            .map(str::to_string)
+            .unwrap_or_else(|| embedder_type.clone());
+    let model_revision = if canonical_embedder == "hash" {
+        "hash".to_string()
+    } else if canonical_embedder == crate::search::dashscope_embedder::QWEN_V4_EMBEDDER_NAME {
+        indexer.embedder_id().to_string()
+    } else {
+        ModelManifest::for_embedder(&canonical_embedder)
+            .unwrap_or_else(ModelManifest::minilm_v2)
+            .revision
+    };
 
     // Sub-fix 1 for cass#257: open a JSONL progress sink whose
     // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
@@ -98874,6 +98884,10 @@ mod cli_models_resolution_tests {
             ("nomic-embed-768", "nomic-embed"),
             ("nomic-embed-text-v1.5", "nomic-embed"),
             ("NOMIC-EMBED", "nomic-embed"),
+            ("qwen-v4", "qwen-v4"),
+            ("qwen-embedding", "qwen-v4"),
+            ("text-embedding-v4", "qwen-v4"),
+            ("dashscope-text-embedding-v4", "qwen-v4"),
         ] {
             assert_eq!(
                 resolve_cli_model_name(alias).expect("registered alias must resolve"),
@@ -98902,6 +98916,7 @@ mod cli_models_resolution_tests {
             err.message.contains("snowflake-arctic-s")
                 && err.message.contains("nomic-embed")
                 && err.message.contains("all-minilm-l6-v2")
+                && err.message.contains("qwen-v4")
                 && err.message.contains("qwen3-rerank"),
             "error must list supported models so operators discover non-default options; \
              got {message:?}",
@@ -98910,7 +98925,7 @@ mod cli_models_resolution_tests {
         assert_eq!(
             err.hint.as_deref(),
             Some(
-                "Use 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking"
+                "Use 'cass index --semantic --embedder qwen-v4' after setting DASHSCOPE_API_KEY, or 'cass search --rerank --reranker qwen3-rerank <query>' for DashScope reranking"
             )
         );
         assert!(!err.retryable);
@@ -99024,6 +99039,21 @@ mod cli_models_resolution_tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("cass search '<query>' --rerank --reranker qwen3-rerank")
+        );
+    }
+
+    #[test]
+    fn remote_embedder_install_reports_no_local_install_needed() {
+        let err = run_models_install("qwen-v4", None, None, true, None)
+            .expect_err("remote embedder install must be rejected clearly");
+        assert_eq!(err.code, 20);
+        assert_eq!(err.kind, "model");
+        assert!(err.message.contains("remote DashScope embedding service"));
+        assert!(
+            err.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cass index --semantic --embedder qwen-v4")
         );
     }
 }

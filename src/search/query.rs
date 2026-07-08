@@ -4579,6 +4579,22 @@ impl SearchClient {
             )));
         }
 
+        if crate::search::embedder_registry::canonical_embedder_name(embedder_id)
+            == Some(crate::search::dashscope_embedder::QWEN_V4_EMBEDDER_NAME)
+        {
+            let embedder = crate::search::dashscope_embedder::DashScopeEmbedder::from_env()
+                .with_context(|| "loading DashScope qwen-v4 embedder")?;
+            if embedder.dimension() != dimension {
+                bail!(
+                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
+                    embedder_id,
+                    dimension,
+                    embedder.dimension()
+                );
+            }
+            return Ok(Arc::new(embedder));
+        }
+
         if let Some(embedder_name) =
             crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
         {

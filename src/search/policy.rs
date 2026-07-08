@@ -147,8 +147,8 @@ impl ModelDownloadPolicy {
 /// Default fast-tier embedder name (always available, no model files).
 pub const DEFAULT_FAST_TIER_EMBEDDER: &str = "hash";
 
-/// Default quality-tier embedder name (requires ML model files).
-pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "minilm";
+/// Default quality-tier embedder name (uses DashScope when configured).
+pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "qwen-v4";
 
 /// Default reranker name (requires cross-encoder model files).
 pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
@@ -158,8 +158,8 @@ pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
 /// Fast-tier embedding dimension (hash embedder).
 pub const DEFAULT_FAST_DIMENSION: usize = 256;
 
-/// Quality-tier embedding dimension (MiniLM).
-pub const DEFAULT_QUALITY_DIMENSION: usize = 384;
+/// Quality-tier embedding dimension (DashScope text-embedding-v4 default).
+pub const DEFAULT_QUALITY_DIMENSION: usize = 2048;
 
 /// Quality-tier score weight when blending (0.0-1.0).
 pub const DEFAULT_QUALITY_WEIGHT: f32 = 0.7;
@@ -235,7 +235,7 @@ pub struct SemanticPolicy {
     /// Fast-tier embedder name (e.g., "hash").
     pub fast_tier_embedder: String,
 
-    /// Quality-tier embedder name (e.g., "minilm").
+    /// Quality-tier embedder name (e.g., "qwen-v4").
     pub quality_tier_embedder: String,
 
     /// Reranker name (e.g., "ms-marco-minilm").
@@ -767,7 +767,7 @@ pub enum InvalidationAction {
 /// Metadata stored alongside semantic assets to detect invalidation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticAssetManifest {
-    /// Embedder ID that produced these vectors (e.g., "minilm-384").
+    /// Embedder ID that produced these vectors (e.g., "dashscope-text-embedding-v4-2048").
     pub embedder_id: String,
     /// HuggingFace revision hash of the model checkpoint.
     pub model_revision: String,
@@ -786,7 +786,7 @@ impl SemanticAssetManifest {
     /// the model revision currently installed.
     ///
     /// `expected_embedder_id` should be the full embedder ID for the tier this
-    /// manifest belongs to (e.g., `"fnv1a-384"` for fast, `"minilm-384"` for
+    /// manifest belongs to (e.g., `"fnv1a-384"` for fast, `"dashscope-text-embedding-v4-2048"` for
     /// quality).
     pub fn invalidation_action(
         &self,
@@ -1003,10 +1003,10 @@ mod tests {
         let p = SemanticPolicy::compiled_defaults();
         assert_eq!(p.mode, SemanticMode::HybridPreferred);
         assert_eq!(p.fast_tier_embedder, "hash");
-        assert_eq!(p.quality_tier_embedder, "minilm");
+        assert_eq!(p.quality_tier_embedder, "qwen-v4");
         assert_eq!(p.download_policy, ModelDownloadPolicy::OptIn);
         assert_eq!(p.fast_dimension, 256);
-        assert_eq!(p.quality_dimension, 384);
+        assert_eq!(p.quality_dimension, 2048);
         assert!((p.quality_weight - 0.7).abs() < f32::EPSILON);
         assert_eq!(p.max_refinement_docs, 100);
         assert_eq!(p.semantic_budget_mb, 500);
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(p.max_backfill_threads, 4);
         // Unset fields remain default.
         assert_eq!(p.fast_tier_embedder, "hash");
-        assert_eq!(p.quality_dimension, 384);
+        assert_eq!(p.quality_dimension, 2048);
     }
 
     #[test]
@@ -1408,7 +1408,7 @@ mod tests {
         let report = SemanticCapabilityReport::from_policy(&policy, cap, 0);
 
         assert_eq!(report.capability, SemanticCapability::FastTierOnly);
-        assert_eq!(report.quality_tier_embedder, "minilm");
+        assert_eq!(report.quality_tier_embedder, "qwen-v4");
         assert_eq!(report.download_policy, ModelDownloadPolicy::OptIn);
     }
 

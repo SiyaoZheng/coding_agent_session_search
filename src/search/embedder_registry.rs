@@ -17,7 +17,8 @@
 //!
 //! | Name | ID | Dimension | Type | Notes |
 //! |------|-----|-----------|------|-------|
-//! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
+//! | qwen-v4 | dashscope-text-embedding-v4-2048 | 2048 | ML/API | Default semantic embedder when DashScope is configured |
+//! | minilm | minilm-384 | 384 | ML | Local semantic embedder |
 //! | hash | fnv1a-384 | 384 | Hash | Always available fallback |
 //!
 //! # Example
@@ -39,15 +40,38 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::dashscope_embedder::{
+    DEFAULT_QWEN_EMBEDDING_DIMENSION, DashScopeEmbedder, QWEN_V4_EMBEDDER_ID, QWEN_V4_EMBEDDER_NAME,
+};
 use super::embedder::{Embedder, EmbedderError, EmbedderInfo, EmbedderResult};
 use super::fastembed_embedder::FastEmbedder;
 use super::hash_embedder::HashEmbedder;
 
 /// Default embedder name when none specified.
-pub const DEFAULT_EMBEDDER: &str = "minilm";
+pub const DEFAULT_EMBEDDER: &str = QWEN_V4_EMBEDDER_NAME;
 
 /// Hash embedder name (always available).
 pub const HASH_EMBEDDER: &str = "hash";
+
+/// Resolve a user-facing embedder name or persisted embedder id to a canonical
+/// registry name.
+pub fn canonical_embedder_name(name: &str) -> Option<&'static str> {
+    let normalized = name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "qwen-v4"
+        | "qwen"
+        | "qwen-embed"
+        | "qwen-embedding"
+        | "qwen-text-embedding"
+        | "text-embedding-v4"
+        | "dashscope"
+        | "dashscope-embedding"
+        | "dashscope-text-embedding-v4"
+        | QWEN_V4_EMBEDDER_ID => Some(QWEN_V4_EMBEDDER_NAME),
+        "hash" => Some(HASH_EMBEDDER),
+        _ => FastEmbedder::canonical_name(&normalized),
+    }
+}
 
 /// Information about a registered embedder.
 ///
@@ -87,6 +111,9 @@ pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
 impl RegisteredEmbedder {
     /// Check if this embedder is available in the given data directory.
     pub fn is_available(&self, data_dir: &Path) -> bool {
+        if self.name == QWEN_V4_EMBEDDER_NAME {
+            return DashScopeEmbedder::is_configured_from_env();
+        }
         if !self.requires_model_files {
             return true;
         }
@@ -120,6 +147,9 @@ impl RegisteredEmbedder {
 
     /// Get missing model files for this embedder.
     pub fn missing_files(&self, data_dir: &Path) -> Vec<String> {
+        if self.name == QWEN_V4_EMBEDDER_NAME {
+            return Vec::new();
+        }
         if !self.requires_model_files {
             return Vec::new();
         }
@@ -166,6 +196,19 @@ impl RegisteredEmbedder {
 /// Models marked with `bakeoff_eligible: true` are candidates for the embedding bake-off
 /// (released after 2025-11-01). The baseline (minilm) is not eligible but used for comparison.
 pub static EMBEDDERS: &[RegisteredEmbedder] = &[
+    // === Remote quality default (available when DashScope is configured) ===
+    RegisteredEmbedder {
+        name: QWEN_V4_EMBEDDER_NAME,
+        id: QWEN_V4_EMBEDDER_ID,
+        dimension: DEFAULT_QWEN_EMBEDDING_DIMENSION,
+        is_semantic: true,
+        description: "DashScope text-embedding-v4 - high-accuracy multilingual embeddings via Alibaba Cloud Model Studio",
+        requires_model_files: false,
+        release_date: "2026-06-01",
+        huggingface_id: "AlibabaCloud/ModelStudio:text-embedding-v4",
+        size_bytes: 0,
+        is_baseline: false,
+    },
     // === Baseline (not eligible for bake-off) ===
     RegisteredEmbedder {
         name: "minilm",
@@ -247,7 +290,7 @@ impl EmbedderRegistry {
 
     /// Get embedder info by name.
     pub fn get(&self, name: &str) -> Option<&'static RegisteredEmbedder> {
-        let name_lower = FastEmbedder::canonical_name(name)
+        let name_lower = canonical_embedder_name(name)
             .unwrap_or_else(|| name.trim())
             .to_ascii_lowercase();
         EMBEDDERS.iter().find(|e| {
@@ -322,6 +365,12 @@ impl EmbedderRegistry {
         })?;
 
         if !embedder.is_available(&self.data_dir) {
+            if embedder.name == QWEN_V4_EMBEDDER_NAME {
+                return Err(embedder_unavailable(
+                    name,
+                    "missing DashScope API key; set DASHSCOPE_API_KEY",
+                ));
+            }
             let model_dir = FastEmbedder::runtime_model_dir_for(&self.data_dir, embedder.name);
             let missing = model_dir
                 .as_ref()
@@ -380,6 +429,10 @@ pub fn get_embedder(data_dir: &Path, name: Option<&str>) -> EmbedderResult<Arc<d
 /// Load an embedder by registered name.
 fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn Embedder>> {
     match name {
+        QWEN_V4_EMBEDDER_NAME => {
+            let embedder = DashScopeEmbedder::from_env()?;
+            Ok(Arc::new(embedder))
+        }
         "hash" => {
             let embedder = HashEmbedder::default();
             Ok(Arc::new(embedder))
@@ -441,6 +494,11 @@ mod tests {
         assert!(minilm.is_some());
         assert_eq!(minilm.unwrap().dimension, 384);
 
+        let qwen = registry.get("qwen");
+        assert!(qwen.is_some());
+        assert_eq!(qwen.unwrap().name, QWEN_V4_EMBEDDER_NAME);
+        assert_eq!(qwen.unwrap().dimension, DEFAULT_QWEN_EMBEDDING_DIMENSION);
+
         let hash = registry.get("hash");
         assert!(hash.is_some());
         assert_eq!(hash.unwrap().dimension, 384);
@@ -456,6 +514,10 @@ mod tests {
         let minilm = registry.get("minilm-384");
         assert!(minilm.is_some());
         assert_eq!(minilm.unwrap().name, "minilm");
+
+        let qwen = registry.get(QWEN_V4_EMBEDDER_ID);
+        assert!(qwen.is_some());
+        assert_eq!(qwen.unwrap().name, QWEN_V4_EMBEDDER_NAME);
 
         let hash = registry.get("fnv1a-384");
         assert!(hash.is_some());
@@ -500,9 +562,14 @@ mod tests {
     fn test_best_available_fallback() {
         let (_tmp, registry) = registry_fixture();
 
-        // Without model files, best_available should return hash
+        // Without model files, best_available returns qwen when DashScope is
+        // configured, otherwise hash.
         let best = registry.best_available();
-        assert_eq!(best.name, "hash");
+        if DashScopeEmbedder::is_configured_from_env() {
+            assert_eq!(best.name, QWEN_V4_EMBEDDER_NAME);
+        } else {
+            assert_eq!(best.name, "hash");
+        }
     }
 
     #[test]
@@ -516,9 +583,14 @@ mod tests {
     #[test]
     fn test_get_embedder_default_no_models() {
         let tmp = tempdir().unwrap();
-        // Without model files, should fall back to hash
+        // Without model files, should use qwen if DashScope is configured and
+        // fall back to hash otherwise.
         let embedder = get_embedder(tmp.path(), None).unwrap();
-        assert_eq!(embedder.id(), "fnv1a-384");
+        if DashScopeEmbedder::is_configured_from_env() {
+            assert_eq!(embedder.id(), QWEN_V4_EMBEDDER_ID);
+        } else {
+            assert_eq!(embedder.id(), "fnv1a-384");
+        }
     }
 
     #[test]
@@ -562,11 +634,11 @@ mod tests {
         let (_tmp, registry) = registry_fixture();
 
         let eligible = registry.bakeoff_eligible();
-        // Should have exactly 2 eligible models: snowflake, nomic
+        // Should have exactly 3 eligible models: qwen, snowflake, nomic
         assert_eq!(
             eligible.len(),
-            2,
-            "Expected 2 eligible models, got {}",
+            3,
+            "Expected 3 eligible models, got {}",
             eligible.len()
         );
 
@@ -583,6 +655,10 @@ mod tests {
         );
 
         // Verify the correct models are in the eligible list
+        assert!(
+            eligible.iter().any(|e| e.name == QWEN_V4_EMBEDDER_NAME),
+            "qwen-v4 should be in eligible list"
+        );
         assert!(
             eligible.iter().any(|e| e.name == "snowflake-arctic-s"),
             "snowflake should be in eligible list"
@@ -646,6 +722,13 @@ mod tests {
     #[test]
     fn test_eligible_embedder_metadata() {
         let (_tmp, registry) = registry_fixture();
+
+        let qwen = registry.get(QWEN_V4_EMBEDDER_NAME).unwrap();
+        assert!(qwen.is_bakeoff_eligible());
+        let metadata = qwen.to_model_metadata();
+        assert!(!metadata.is_baseline);
+        assert!(metadata.is_eligible());
+        assert_eq!(metadata.dimension, Some(DEFAULT_QWEN_EMBEDDING_DIMENSION));
 
         // Check snowflake (eligible candidate, same dimension as minilm)
         let snowflake = registry.get("snowflake-arctic-s").unwrap();
