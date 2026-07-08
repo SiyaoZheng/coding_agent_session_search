@@ -235,6 +235,124 @@ impl SemanticBackfillBatchOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticContentFingerprint {
+    total_conversations: u64,
+    max_conversation_id: i64,
+    max_message_id: i64,
+}
+
+fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
+    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
+    let total_conversations = parts.next()?.parse::<u64>().ok()?;
+    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
+    let max_message_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SemanticContentFingerprint {
+        total_conversations,
+        max_conversation_id,
+        max_message_id,
+    })
+}
+
+fn semantic_checkpoint_db_compatible_for_resume(
+    checkpoint: &BuildCheckpoint,
+    current_db_fingerprint: &str,
+) -> bool {
+    if checkpoint.is_valid(current_db_fingerprint) {
+        return true;
+    }
+    if checkpoint.schema_version != SEMANTIC_SCHEMA_VERSION
+        || checkpoint.chunking_version != CHUNKING_STRATEGY_VERSION
+    {
+        return false;
+    }
+
+    let Some(checkpoint_fp) = parse_semantic_content_fingerprint(&checkpoint.db_fingerprint) else {
+        return false;
+    };
+    let Some(current_fp) = parse_semantic_content_fingerprint(current_db_fingerprint) else {
+        return false;
+    };
+    let checkpoint_message_id = checkpoint.last_message_id.unwrap_or_default();
+
+    current_fp.total_conversations >= checkpoint_fp.total_conversations
+        && current_fp.max_conversation_id >= checkpoint_fp.max_conversation_id
+        && current_fp.max_message_id >= checkpoint_fp.max_message_id
+        && checkpoint.last_offset <= checkpoint_fp.max_conversation_id
+        && checkpoint.last_offset <= current_fp.max_conversation_id
+        && checkpoint_message_id <= checkpoint_fp.max_message_id
+        && checkpoint_message_id <= current_fp.max_message_id
+}
+
+fn semantic_checkpoint_staging_available_for_resume(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    checkpoint: &BuildCheckpoint,
+    current_db_fingerprint: &str,
+) -> bool {
+    if checkpoint.docs_embedded == 0 {
+        return true;
+    }
+    semantic_staging_index_path(data_dir, tier, embedder_id, current_db_fingerprint).exists()
+        || semantic_staging_index_path(data_dir, tier, embedder_id, &checkpoint.db_fingerprint)
+            .exists()
+}
+
+fn copy_resume_staging_index_if_needed(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    current_db_fingerprint: &str,
+    checkpoint: Option<&BuildCheckpoint>,
+    staging_path: &Path,
+) -> Result<()> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    if checkpoint.db_fingerprint == current_db_fingerprint || staging_path.exists() {
+        return Ok(());
+    }
+
+    let previous_staging_path =
+        semantic_staging_index_path(data_dir, tier, embedder_id, &checkpoint.db_fingerprint);
+    if !previous_staging_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = staging_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = staging_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("semantic-staging.fsvi");
+    let temp_path = staging_path.with_file_name(format!(
+        ".{file_name}.copy-{}-{}.tmp",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = fs::remove_file(&temp_path);
+    fs::copy(&previous_staging_path, &temp_path).with_context(|| {
+        format!(
+            "copying semantic staging index {} to {}",
+            previous_staging_path.display(),
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, staging_path).with_context(|| {
+        format!(
+            "installing semantic staging index {} to {}",
+            temp_path.display(),
+            staging_path.display()
+        )
+    })?;
+    sync_parent_directory(staging_path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticShardBuildPlan {
     pub tier: TierKind,
@@ -2148,7 +2266,17 @@ impl SemanticIndexer {
             .filter(|checkpoint| {
                 checkpoint.tier == plan.tier
                     && checkpoint.embedder_id == self.embedder_id()
-                    && checkpoint.is_valid(&plan.db_fingerprint)
+                    && semantic_checkpoint_db_compatible_for_resume(
+                        checkpoint,
+                        &plan.db_fingerprint,
+                    )
+                    && semantic_checkpoint_staging_available_for_resume(
+                        data_dir,
+                        plan.tier,
+                        self.embedder_id(),
+                        checkpoint,
+                        &plan.db_fingerprint,
+                    )
             })
             .cloned();
         let prior_conversations = prior_checkpoint
@@ -2170,6 +2298,14 @@ impl SemanticIndexer {
                 },
             );
         }
+        copy_resume_staging_index_if_needed(
+            data_dir,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+            prior_checkpoint.as_ref(),
+            &staging_path,
+        )?;
         let mut staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
@@ -2409,7 +2545,14 @@ impl SemanticIndexer {
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
             checkpoint.tier == plan.tier
                 && checkpoint.embedder_id == self.embedder_id()
-                && checkpoint.is_valid(&plan.db_fingerprint)
+                && semantic_checkpoint_db_compatible_for_resume(checkpoint, &plan.db_fingerprint)
+                && semantic_checkpoint_staging_available_for_resume(
+                    data_dir,
+                    plan.tier,
+                    self.embedder_id(),
+                    checkpoint,
+                    &plan.db_fingerprint,
+                )
         });
         let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
         let prior_last_message_id =
@@ -3405,6 +3548,113 @@ mod tests {
         assert_eq!(checkpoint.docs_embedded, 2);
         assert_eq!(manifest.backlog.total_conversations, 2);
         assert!(SemanticManifest::path(temp.path()).exists());
+    }
+
+    #[test]
+    fn capped_backfill_resumes_across_append_only_db_fingerprint_growth() -> Result<()> {
+        let temp = tempdir()?;
+        let data_dir = temp.path().join("data");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("append-only-old", "old semantic message"),
+        )?;
+        let checkpoint_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)?;
+
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None)?;
+        indexer.run_backfill_batch_with_sink(
+            &[EmbeddingInput::new(1, "old semantic message")],
+            &data_dir,
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: checkpoint_fingerprint.clone(),
+                model_revision: "hash".to_string(),
+                total_conversations: 2,
+                conversations_in_batch: 1,
+                last_offset: 1,
+                cursor_exhausted: false,
+            },
+            Some(1),
+            &SemanticProgressSink::disabled(),
+        )?;
+        anyhow::ensure!(
+            semantic_staging_index_path(
+                &data_dir,
+                TierKind::Fast,
+                indexer.embedder_id(),
+                &checkpoint_fingerprint,
+            )
+            .exists(),
+            "first batch should leave a staging index for resume"
+        );
+
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("append-only-new", "new semantic message"),
+        )?;
+        let current_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)?;
+        anyhow::ensure!(
+            checkpoint_fingerprint != current_fingerprint,
+            "test must exercise append-only fingerprint growth"
+        );
+
+        let outcome = indexer.run_capped_backfill_from_storage_with_sink(
+            &storage,
+            &data_dir,
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: current_fingerprint.clone(),
+                model_revision: "hash".to_string(),
+                max_conversations: 8,
+            },
+            &SemanticProgressSink::disabled(),
+        )?;
+
+        anyhow::ensure!(outcome.published, "second batch should publish");
+        anyhow::ensure!(
+            outcome.last_offset == 2,
+            "append-only resume should continue after the checkpoint offset, got {}",
+            outcome.last_offset
+        );
+        anyhow::ensure!(
+            outcome.embedded_docs == 1,
+            "second batch should embed only the appended conversation, got {} docs",
+            outcome.embedded_docs
+        );
+        let final_index = FsVectorIndex::open(&vector_index_path(&data_dir, indexer.embedder_id()))
+            .map_err(|err| anyhow::anyhow!("open final semantic index: {err}"))?;
+        anyhow::ensure!(
+            final_index.record_count() == 2,
+            "published index should contain prior + appended docs, got {}",
+            final_index.record_count()
+        );
+        let artifact = manifest
+            .fast_tier
+            .as_ref()
+            .expect("published fast artifact");
+        anyhow::ensure!(
+            artifact.db_fingerprint == current_fingerprint,
+            "artifact fingerprint should advance to the current DB"
+        );
+        anyhow::ensure!(
+            artifact.doc_count == 2,
+            "artifact doc_count should include copied staging docs"
+        );
+        Ok(())
     }
 
     #[test]
