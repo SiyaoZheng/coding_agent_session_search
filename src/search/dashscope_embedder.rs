@@ -23,6 +23,12 @@ const DEFAULT_EMBEDDING_ENDPOINT: &str =
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TEXT_EMBEDDING_V4_BATCH: usize = 10;
 const VALID_TEXT_EMBEDDING_V4_DIMENSIONS: &[usize] = &[2048, 1536, 1024, 768, 512, 256, 128, 64];
+/// In-flight request cap for one `embed_batch_sync` call. Default 1 preserves
+/// the serial behavior; `CASS_DASHSCOPE_EMBEDDING_CONCURRENCY` /
+/// `DASHSCOPE_EMBEDDING_CONCURRENCY` opt in to parallel waves.
+const DEFAULT_EMBEDDING_CONCURRENCY: usize = 1;
+const MAX_EMBEDDING_CONCURRENCY: usize = 16;
+const EMBED_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 /// Embedder implementation backed by Alibaba Cloud DashScope `text-embedding-v4`.
 pub struct DashScopeEmbedder {
@@ -143,9 +149,45 @@ impl Embedder for DashScopeEmbedder {
             ));
         }
 
+        let chunks: Vec<&[&str]> = texts.chunks(MAX_TEXT_EMBEDDING_V4_BATCH).collect();
+        let concurrency = resolve_embedding_concurrency().min(chunks.len());
+
+        if concurrency <= 1 {
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for chunk in chunks {
+                embeddings.extend(self.embed_request_chunk_with_retry(chunk)?);
+            }
+            return Ok(embeddings);
+        }
+
+        // Order-preserving wave parallelism: at most `concurrency` requests in
+        // flight, and each wave joins fully before the next starts so an error
+        // never leaves orphan requests running past the batch.
         let mut embeddings = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(MAX_TEXT_EMBEDDING_V4_BATCH) {
-            embeddings.extend(self.embed_request_chunk(chunk)?);
+        for wave in chunks.chunks(concurrency) {
+            let wave_results: Vec<EmbedderResult<Vec<Vec<f32>>>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = wave
+                        .iter()
+                        .map(|&chunk| {
+                            scope.spawn(move || self.embed_request_chunk_with_retry(chunk))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|_| {
+                                Err(embedding_failed(
+                                    QWEN_V4_EMBEDDER_NAME,
+                                    "embedding worker thread panicked",
+                                ))
+                            })
+                        })
+                        .collect()
+                });
+            for result in wave_results {
+                embeddings.extend(result?);
+            }
         }
         Ok(embeddings)
     }
@@ -176,6 +218,23 @@ impl Embedder for DashScopeEmbedder {
 }
 
 impl DashScopeEmbedder {
+    /// Retry wrapper: embedding requests are idempotent, so transient
+    /// DashScope failures (timeouts, 429s, 5xx) get up to two linear-backoff
+    /// retries before the whole batch is failed.
+    fn embed_request_chunk_with_retry(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
+        let mut last_err = None;
+        for attempt in 0..EMBED_RETRY_MAX_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(1_000 * u64::from(attempt)));
+            }
+            match self.embed_request_chunk(texts) {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.expect("at least one embedding attempt"))
+    }
+
     fn embed_request_chunk(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
         let request = DashScopeEmbeddingRequest {
             model: self.model.as_str(),
@@ -339,6 +398,16 @@ fn l2_normalize(mut vector: Vec<f32>) -> Vec<f32> {
         *value *= inv_norm;
     }
     vector
+}
+
+fn resolve_embedding_concurrency() -> usize {
+    first_nonempty_env(&[
+        "CASS_DASHSCOPE_EMBEDDING_CONCURRENCY",
+        "DASHSCOPE_EMBEDDING_CONCURRENCY",
+    ])
+    .and_then(|value| value.parse::<usize>().ok())
+    .map(|value| value.clamp(1, MAX_EMBEDDING_CONCURRENCY))
+    .unwrap_or(DEFAULT_EMBEDDING_CONCURRENCY)
 }
 
 fn resolve_embedding_dimension() -> EmbedderResult<usize> {
