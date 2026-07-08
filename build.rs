@@ -136,12 +136,11 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Pins the frankensearch rev carrying the pure-Rust `native` feature
-        // (frankentorch NativeEmbedder + NativeReranker), with frankentorch
-        // referenced by git rev inside frankensearch so the feature is
-        // git-consumable from cass (cass #308).
-        expected_rev: "2eaf753955f58d8ce0f6203224d1ee2759b7cc49",
+        expected_git: "https://github.com/SiyaoZheng/frankensearch",
+        // Pins Adrian's frankensearch fork carrying the pure-Rust `native`
+        // feature (frankentorch NativeEmbedder + NativeReranker) plus cass's
+        // additive jieba Chinese lexical fields on top of CJK bigram recall.
+        expected_rev: "4e36bcc5a84857332b39558ca67c895e7d61689d",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`

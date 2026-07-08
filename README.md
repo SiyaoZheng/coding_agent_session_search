@@ -2987,7 +2987,7 @@ Update check state is stored in the data directory:
 | `frankensqlite` / `fsqlite-types` | `=0.1.11` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 shadow-table persistence/lazy-reopen + MAX/MIN(rowid) leaf-seek + 0.1.11 FTS5 merge/finalize O(N²)→O(N) spin fix [cass#301] + composite-UNIQUE FK INSERT [#116] + correlated NOT EXISTS planner [#117] fixes) |
 | `franken-agent-detection` | `77951e8` |
 | `asupersync` | `=0.3.5` |
-| `frankensearch` | `2eaf7539` (pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308) |
+| `frankensearch` | `4e36bcc` (SiyaoZheng fork; pure-Rust `native` feature plus additive jieba Chinese lexical fields over CJK bigram recall, limited to CJK documents) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 

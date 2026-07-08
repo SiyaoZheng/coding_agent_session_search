@@ -88,7 +88,7 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2eaf753955f58d8ce0f6203224d1ee2759b7cc49", default-features = false, features = ["hash", "lexical", "ann", "native"] }
+frankensearch = { version = "0.3.2", git = "https://github.com/SiyaoZheng/frankensearch", rev = "4e36bcc5a84857332b39558ca67c895e7d61689d", default-features = false, features = ["hash", "lexical", "ann", "native"] }
 franken-agent-detection = { version = "0.1.9", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "3c30766db8708a6b63101fdb085a8cdbb74f0d1d", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
@@ -248,7 +248,7 @@ strip = false
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
+# [patch."https://github.com/SiyaoZheng/frankensearch"]
 # frankensearch = { path = "../frankensearch/frankensearch" }
 # frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
 # frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }

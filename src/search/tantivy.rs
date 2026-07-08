@@ -2133,9 +2133,9 @@ mod tests {
     fn index_dir_creates_versioned_path() {
         let dir = TempDir::new().expect("temp dir");
         let result = index_dir(dir.path()).expect("index dir");
-        // frankensearch CASS_SCHEMA_VERSION bumped v7 -> v8 with the tantivy 0.26.1
-        // upgrade (rev 2cad158f / frankensearch 0.3.2).
-        assert!(result.ends_with("index/v8"));
+        // frankensearch CASS_SCHEMA_VERSION bumped v8 -> v9 when cass added
+        // additive jieba Chinese word fields on top of CJK bigram recall.
+        assert!(result.ends_with("index/v9"));
     }
 
     #[test]
